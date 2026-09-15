@@ -50,11 +50,11 @@ def get_llm_explanation(tenure, monthly, churn_proba, risk_label):
     if not GEMINI_API_KEY:
         return "LLM unavailable: GEMINI_API_KEY belum dipasang di Railway."
 
-    prompt = f"""Kamu adalah AI business analyst untuk tim customer retention.
+    prompt = f"""Kamu adalah AI business analyst untuk tim customer retention di Indonesia.
 
 Data customer:
 - Tenure: {tenure} bulan
-- Monthly Charges: ${monthly:.0f}
+- Monthly Charges: Rp {monthly:,.0f}
 - Churn Probability: {churn_proba*100:.1f}%
 - Risk Segment: {risk_label}
 
@@ -63,7 +63,10 @@ Berikan analisis singkat dalam 3 kalimat:
 2. Faktor utama yang mempengaruhi
 3. Rekomendasi aksi konkret untuk tim retention
 
-Gunakan bahasa Indonesia yang profesional."""
+ATURAN KETAT:
+- Wajib menggunakan mata uang RUPIAH (Rp). DILARANG MENGGUNAKAN SIMBOL DOLLAR ($) ATAU MATA UANG LAIN!
+- DILARANG MENGGUNAKAN EMOJI ATAU EMOTICON APA PUN.
+- Gunakan bahasa Indonesia yang profesional, lugas, dan to the point."""
 
     max_retries = 2
     for attempt in range(max_retries):
@@ -74,14 +77,14 @@ Gunakan bahasa Indonesia yang profesional."""
                 json={"contents": [{"parts": [{"text": prompt}]}]},
                 timeout=60
             )
-            
+
             if response.status_code == 200:
                 result = response.json()
                 return result["candidates"][0]["content"]["parts"][0]["text"]
             else:
                 err_msg = response.json().get("error", {}).get("message", response.text)
                 return f"LLM Error ({response.status_code}): {err_msg}"
-                
+
         except requests.exceptions.Timeout:
             if attempt < max_retries - 1:
                 time.sleep(1)
