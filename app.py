@@ -3,6 +3,7 @@ import os
 import joblib
 import numpy as np
 import requests
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -46,6 +47,9 @@ def get_risk_label(churn_proba):
         return "Low Risk"
 
 def get_llm_explanation(tenure, monthly, churn_proba, risk_label):
+    if not GEMINI_API_KEY:
+        return "LLM unavailable: GEMINI_API_KEY belum dipasang di Railway."
+
     prompt = f"""Kamu adalah AI business analyst untuk tim customer retention.
 
 Data customer:
@@ -61,17 +65,30 @@ Berikan analisis singkat dalam 3 kalimat:
 
 Gunakan bahasa Indonesia yang profesional."""
 
-    try:
-        response = requests.post(
-            GEMINI_URL,
-            headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=10
-        )
-        result = response.json()
-        return result["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        return f"LLM unavailable: {str(e)}"
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                GEMINI_URL,
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                err_msg = response.json().get("error", {}).get("message", response.text)
+                return f"LLM Error ({response.status_code}): {err_msg}"
+                
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            return "LLM unavailable: Timeout saat menghubungi server Gemini."
+        except Exception as e:
+            return f"LLM unavailable: {str(e)}"
 
 def predict_single(customer: CustomerData):
     input_dict = {col: 0 for col in feature_cols}
