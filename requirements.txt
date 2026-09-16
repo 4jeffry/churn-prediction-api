@@ -8,3 +8,4 @@ tensorflow
 joblib
 requests
 pydantic
+evidently
