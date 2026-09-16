@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
+from monitor import check_drift
 
 app = FastAPI(title="Churn Prediction API")
 
@@ -28,6 +29,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 BASE_URL = "https://generativelanguage.googleapis.com"
 ENDPOINT = "/v1beta/models/gemini-3.6-flash:generateContent"
 GEMINI_URL = BASE_URL + ENDPOINT + "?key=" + GEMINI_API_KEY
+
+# Buffer untuk simpan recent predictions
+recent_predictions_buffer = []
 
 class CustomerData(BaseModel):
     tenure: float
@@ -105,6 +109,11 @@ def predict_single(customer: CustomerData):
     X = np.array([[input_dict[col] for col in feature_cols]])
     X_scaled = scaler.transform(X)
 
+    # Simpan ke buffer untuk monitoring
+    recent_predictions_buffer.append(input_dict)
+    if len(recent_predictions_buffer) > 500:
+        recent_predictions_buffer.pop(0)
+
     churn_proba = float(xgb_model.predict_proba(X_scaled)[0][1])
     churn_pred = int(churn_proba >= 0.5)
     risk_label = get_risk_label(churn_proba)
@@ -155,4 +164,23 @@ def predict_batch(request: BatchRequest):
             )
         },
         "predictions": results
+    }
+
+@app.get("/monitoring/drift")
+def monitoring_drift():
+    if len(recent_predictions_buffer) < 50:
+        return {
+            "status": "insufficient_data",
+            "message": f"Butuh minimal 50 predictions, baru ada {len(recent_predictions_buffer)}",
+            "current_count": len(recent_predictions_buffer)
+        }
+    return check_drift(recent_predictions_buffer)
+
+@app.get("/monitoring/status")
+def monitoring_status():
+    return {
+        "total_predictions_buffered": len(recent_predictions_buffer),
+        "buffer_capacity": 500,
+        "model": "XGBoost",
+        "status": "active"
     }
