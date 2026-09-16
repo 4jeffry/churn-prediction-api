@@ -3,11 +3,11 @@ import os
 import joblib
 import numpy as np
 import requests
-import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
+from monitor import check_drift
 
 app = FastAPI(title="Churn Prediction API")
 
@@ -29,6 +29,9 @@ BASE_URL = "https://generativelanguage.googleapis.com"
 ENDPOINT = "/v1beta/models/gemini-3.6-flash:generateContent"
 GEMINI_URL = BASE_URL + ENDPOINT + "?key=" + GEMINI_API_KEY
 
+# Buffer untuk simpan recent predictions (in-memory)
+recent_predictions_buffer = []
+
 class CustomerData(BaseModel):
     tenure: float
     MonthlyCharges: float
@@ -47,14 +50,11 @@ def get_risk_label(churn_proba):
         return "Low Risk"
 
 def get_llm_explanation(tenure, monthly, churn_proba, risk_label):
-    if not GEMINI_API_KEY:
-        return "LLM unavailable: GEMINI_API_KEY belum dipasang di Railway."
-
-    prompt = f"""Kamu adalah AI business analyst untuk tim customer retention di Indonesia.
+    prompt = f"""Kamu adalah AI business analyst untuk tim customer retention.
 
 Data customer:
 - Tenure: {tenure} bulan
-- Monthly Charges: Rp {monthly:,.0f}
+- Monthly Charges: ${monthly:.0f}
 - Churn Probability: {churn_proba*100:.1f}%
 - Risk Segment: {risk_label}
 
@@ -63,35 +63,19 @@ Berikan analisis singkat dalam 3 kalimat:
 2. Faktor utama yang mempengaruhi
 3. Rekomendasi aksi konkret untuk tim retention
 
-ATURAN KETAT:
-- Wajib menggunakan mata uang RUPIAH (Rp). DILARANG MENGGUNAKAN SIMBOL DOLLAR ($) ATAU MATA UANG LAIN!
-- DILARANG MENGGUNAKAN EMOJI ATAU EMOTICON APA PUN.
-- Gunakan bahasa Indonesia yang profesional, lugas, dan to the point."""
+Gunakan bahasa Indonesia yang profesional."""
 
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                GEMINI_URL,
-                headers={"Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=60
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                return result["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                err_msg = response.json().get("error", {}).get("message", response.text)
-                return f"LLM Error ({response.status_code}): {err_msg}"
-
-        except requests.exceptions.Timeout:
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                continue
-            return "LLM unavailable: Timeout saat menghubungi server Gemini."
-        except Exception as e:
-            return f"LLM unavailable: {str(e)}"
+    try:
+        response = requests.post(
+            GEMINI_URL,
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=10
+        )
+        result = response.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return f"LLM unavailable: {str(e)}"
 
 def predict_single(customer: CustomerData):
     input_dict = {col: 0 for col in feature_cols}
@@ -104,6 +88,11 @@ def predict_single(customer: CustomerData):
 
     X = np.array([[input_dict[col] for col in feature_cols]])
     X_scaled = scaler.transform(X)
+
+    # Simpan ke buffer untuk monitoring
+    recent_predictions_buffer.append(input_dict)
+    if len(recent_predictions_buffer) > 500:
+        recent_predictions_buffer.pop(0)
 
     churn_proba = float(xgb_model.predict_proba(X_scaled)[0][1])
     churn_pred = int(churn_proba >= 0.5)
@@ -155,4 +144,23 @@ def predict_batch(request: BatchRequest):
             )
         },
         "predictions": results
+    }
+
+@app.get("/monitoring/drift")
+def monitoring_drift():
+    if len(recent_predictions_buffer) < 50:
+        return {
+            "status": "insufficient_data",
+            "message": f"Butuh minimal 50 predictions, baru ada {len(recent_predictions_buffer)}",
+            "current_count": len(recent_predictions_buffer)
+        }
+    return check_drift(recent_predictions_buffer)
+
+@app.get("/monitoring/status")
+def monitoring_status():
+    return {
+        "total_predictions_buffered": len(recent_predictions_buffer),
+        "buffer_capacity": 500,
+        "model": "XGBoost (F1: 0.6296, AUC: 0.8405)",
+        "status": "active"
     }
