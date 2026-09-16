@@ -5,10 +5,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy semua file dan folder pendukung ke dalam container
 COPY app.py .
+COPY monitor.py .
+COPY data/ data/
 COPY models/ models/
-
-ENV GEMINI_API_KEY=""
 
 EXPOSE 7860
 
