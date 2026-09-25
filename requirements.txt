@@ -11,3 +11,4 @@ pydantic
 evidently==0.4.3
 scipy
 plotly
+resend
