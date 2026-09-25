@@ -38,7 +38,7 @@ recent_predictions_buffer = []
 
 class CustomerData(BaseModel):
     customer_id: Optional[str] = "Unknown-ID"
-    customer_name: Optional[str] = "Client"
+    customer_name: Optional[str] = "Klien"
     tenure: float
     MonthlyCharges: float
     TotalCharges: float
@@ -46,6 +46,14 @@ class CustomerData(BaseModel):
 
 class BatchRequest(BaseModel):
     customers: List[CustomerData]
+
+class EmailReportRequest(BaseModel):
+    target_email: str
+    customer_id: str
+    customer_name: str
+    risk_segment: str
+    churn_probability: float
+    ai_explanation: str
 
 def get_risk_label(churn_proba):
     if churn_proba >= 0.6:
@@ -60,7 +68,7 @@ def get_llm_explanation(tenure, monthly, churn_proba, risk_label):
 
 Data customer:
 - Tenure: {tenure} bulan
-- Monthly Charges: ${monthly:.0f}
+- Monthly Charges: Rp {monthly:.0f}
 - Churn Probability: {churn_proba*100:.1f}%
 - Risk Segment: {risk_label}
 
@@ -83,16 +91,15 @@ Gunakan bahasa Indonesia yang profesional."""
     except Exception as e:
         return f"LLM unavailable: {str(e)}"
 
-# Logika Background Task untuk Email Alert
-def send_resend_alert(customer_id, customer_name, churn_proba, explanation):
+# Alert Internal Otomatis (Jika risiko > 60%)
+def send_internal_alert(customer_id, customer_name, churn_proba, explanation):
     if not resend.api_key:
-        print("Alert dibatalkan: RESEND_API_KEY tidak diset.")
         return
 
     html_body = f"""
     <div style="font-family: sans-serif; padding: 20px;">
         <h2 style="color: #e74c3c;">🚨 Alert: Risiko Klien Keluar Tinggi</h2>
-        <p>Sistem ixiera.id mendeteksi klien dengan risiko churn tinggi:</p>
+        <p>Sistem mendeteksi klien dengan risiko churn tinggi:</p>
         <ul>
             <li><strong>ID Klien:</strong> {customer_id}</li>
             <li><strong>Nama:</strong> {customer_name}</li>
@@ -105,14 +112,13 @@ def send_resend_alert(customer_id, customer_name, churn_proba, explanation):
     
     try:
         resend.Emails.send({
-            "from": "ixiera AI System <admin@ixiera.id>",
-            "to": ["support@ixiera.id"], 
+            "from": "ixiera AI System <contact@ixiera.id>",
+            "to": ["contact@ixiera.id"], 
             "subject": f"Action Required: High Risk Client [{customer_id}]",
             "html": html_body,
         })
-        print(f"Alert terkirim untuk {customer_id}")
     except Exception as e:
-        print(f"Gagal mengirim Resend alert: {e}")
+        print(f"Gagal mengirim internal alert: {e}")
 
 def predict_single(customer: CustomerData, background_tasks: BackgroundTasks = None):
     input_dict = {col: 0 for col in feature_cols}
@@ -126,7 +132,6 @@ def predict_single(customer: CustomerData, background_tasks: BackgroundTasks = N
     X = np.array([[input_dict[col] for col in feature_cols]])
     X_scaled = scaler.transform(X)
 
-    # Simpan ke buffer untuk monitoring
     recent_predictions_buffer.append(input_dict)
     if len(recent_predictions_buffer) > 500:
         recent_predictions_buffer.pop(0)
@@ -141,10 +146,10 @@ def predict_single(customer: CustomerData, background_tasks: BackgroundTasks = N
     
     churn_probability_pct = round(churn_proba * 100, 2)
 
-    # Trigger Background Task jika masuk kategori High Risk
+    # Trigger alert internal jika bahaya
     if risk_label == "High Risk" and background_tasks is not None:
         background_tasks.add_task(
-            send_resend_alert, 
+            send_internal_alert, 
             customer.customer_id, 
             customer.customer_name, 
             churn_probability_pct, 
@@ -196,12 +201,45 @@ def predict_batch(request: BatchRequest, background_tasks: BackgroundTasks):
         "predictions": results
     }
 
+# Endpoint Baru: Kirim Laporan ke Email User via Frontend
+@app.post("/send-report")
+def send_report_to_user(req: EmailReportRequest, background_tasks: BackgroundTasks):
+    def send_email():
+        if not resend.api_key:
+            return
+            
+        html_body = f"""
+        <div style="font-family: sans-serif; padding: 20px; color: #333;">
+            <h2 style="color: #0a0a0a;">Laporan Analisis Retensi Klien | ixiera.id</h2>
+            <div style="background: #f5f5f5; padding: 15px; border-radius: 6px; margin-bottom: 20px;">
+                <p><strong>ID Klien:</strong> {req.customer_id}</p>
+                <p><strong>Nama:</strong> {req.customer_name}</p>
+                <p><strong>Status Risiko:</strong> <span style="font-weight: bold;">{req.risk_segment}</span></p>
+                <p><strong>Potensi Keluar:</strong> <span style="color: red; font-weight: bold;">{req.churn_probability}%</span></p>
+            </div>
+            <h3>Saran Strategi Retensi (AI Insight):</h3>
+            <p style="line-height: 1.6;">{req.ai_explanation}</p>
+        </div>
+        """
+        try:
+            resend.Emails.send({
+                "from": "ixiera AI System <contact@ixiera.id>",
+                "to": [req.target_email],
+                "subject": f"Hasil Analisis Retensi - {req.customer_name}",
+                "html": html_body,
+            })
+        except Exception as e:
+            print(f"Gagal kirim laporan ke user: {e}")
+
+    background_tasks.add_task(send_email)
+    return {"message": "Email queued for sending"}
+
 @app.get("/monitoring/drift")
 def monitoring_drift():
     if len(recent_predictions_buffer) < 50:
         return {
             "status": "insufficient_data",
-            "message": f"Butuh minimal 50 predictions, baru ada {len(recent_predictions_buffer)}",
+            "message": f"Butuh minimal 50 predictions",
             "current_count": len(recent_predictions_buffer)
         }
     return check_drift(recent_predictions_buffer)
@@ -211,6 +249,6 @@ def monitoring_status():
     return {
         "total_predictions_buffered": len(recent_predictions_buffer),
         "buffer_capacity": 500,
-        "model": "XGBoost (F1: 0.6296, AUC: 0.8405)",
+        "model": "XGBoost",
         "status": "active"
     }
