@@ -3,11 +3,11 @@ import os
 import joblib
 import numpy as np
 import requests
-import time
-from fastapi import FastAPI
+import resend
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from monitor import check_drift
 
 app = FastAPI(title="Churn Prediction API")
@@ -25,15 +25,20 @@ kmeans = joblib.load("models/kmeans.pkl")
 scaler_seg = joblib.load("models/scaler_seg.pkl")
 feature_cols = joblib.load("models/feature_cols.pkl")
 
+# API Keys & URLs
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 BASE_URL = "https://generativelanguage.googleapis.com"
 ENDPOINT = "/v1beta/models/gemini-3.6-flash:generateContent"
-GEMINI_URL = BASE_URL + ENDPOINT + "?key=" + GEMINI_API_KEY
+GEMINI_URL = f"{BASE_URL}{ENDPOINT}?key={GEMINI_API_KEY}"
 
-# Buffer untuk simpan recent predictions
+resend.api_key = os.environ.get("RESEND_API_KEY", "")
+
+# Buffer untuk simpan recent predictions (in-memory)
 recent_predictions_buffer = []
 
 class CustomerData(BaseModel):
+    customer_id: Optional[str] = "Unknown-ID"
+    customer_name: Optional[str] = "Client"
     tenure: float
     MonthlyCharges: float
     TotalCharges: float
@@ -51,14 +56,11 @@ def get_risk_label(churn_proba):
         return "Low Risk"
 
 def get_llm_explanation(tenure, monthly, churn_proba, risk_label):
-    if not GEMINI_API_KEY:
-        return "LLM unavailable: GEMINI_API_KEY belum dipasang di Railway."
-
-    prompt = f"""Kamu adalah AI business analyst untuk tim customer retention di Indonesia.
+    prompt = f"""Kamu adalah AI business analyst untuk tim customer retention.
 
 Data customer:
 - Tenure: {tenure} bulan
-- Monthly Charges: Rp {monthly:,.0f}
+- Monthly Charges: ${monthly:.0f}
 - Churn Probability: {churn_proba*100:.1f}%
 - Risk Segment: {risk_label}
 
@@ -67,37 +69,52 @@ Berikan analisis singkat dalam 3 kalimat:
 2. Faktor utama yang mempengaruhi
 3. Rekomendasi aksi konkret untuk tim retention
 
-ATURAN KETAT:
-- Wajib menggunakan mata uang RUPIAH (Rp). DILARANG MENGGUNAKAN SIMBOL DOLLAR ($) ATAU MATA UANG LAIN!
-- DILARANG MENGGUNAKAN EMOJI ATAU EMOTICON APA PUN.
-- Gunakan bahasa Indonesia yang profesional, lugas, dan to the point."""
+Gunakan bahasa Indonesia yang profesional."""
 
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            response = requests.post(
-                GEMINI_URL,
-                headers={"Content-Type": "application/json"},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=60
-            )
+    try:
+        response = requests.post(
+            GEMINI_URL,
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=10
+        )
+        result = response.json()
+        return result["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return f"LLM unavailable: {str(e)}"
 
-            if response.status_code == 200:
-                result = response.json()
-                return result["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                err_msg = response.json().get("error", {}).get("message", response.text)
-                return f"LLM Error ({response.status_code}): {err_msg}"
+# Logika Background Task untuk Email Alert
+def send_resend_alert(customer_id, customer_name, churn_proba, explanation):
+    if not resend.api_key:
+        print("Alert dibatalkan: RESEND_API_KEY tidak diset.")
+        return
 
-        except requests.exceptions.Timeout:
-            if attempt < max_retries - 1:
-                time.sleep(1)
-                continue
-            return "LLM unavailable: Timeout saat menghubungi server Gemini."
-        except Exception as e:
-            return f"LLM unavailable: {str(e)}"
+    html_body = f"""
+    <div style="font-family: sans-serif; padding: 20px;">
+        <h2 style="color: #e74c3c;">🚨 Alert: Risiko Klien Keluar Tinggi</h2>
+        <p>Sistem ixiera.id mendeteksi klien dengan risiko churn tinggi:</p>
+        <ul>
+            <li><strong>ID Klien:</strong> {customer_id}</li>
+            <li><strong>Nama:</strong> {customer_name}</li>
+            <li><strong>Risiko:</strong> <span style="color: red;">{churn_proba}%</span></li>
+        </ul>
+        <h3>Insight AI:</h3>
+        <p>{explanation}</p>
+    </div>
+    """
+    
+    try:
+        resend.Emails.send({
+            "from": "ixiera AI System <admin@ixiera.id>",
+            "to": ["support@ixiera.id"], 
+            "subject": f"Action Required: High Risk Client [{customer_id}]",
+            "html": html_body,
+        })
+        print(f"Alert terkirim untuk {customer_id}")
+    except Exception as e:
+        print(f"Gagal mengirim Resend alert: {e}")
 
-def predict_single(customer: CustomerData):
+def predict_single(customer: CustomerData, background_tasks: BackgroundTasks = None):
     input_dict = {col: 0 for col in feature_cols}
     input_dict["tenure"] = customer.tenure
     input_dict["MonthlyCharges"] = customer.MonthlyCharges
@@ -121,9 +138,22 @@ def predict_single(customer: CustomerData):
     explanation = get_llm_explanation(
         customer.tenure, customer.MonthlyCharges, churn_proba, risk_label
     )
+    
+    churn_probability_pct = round(churn_proba * 100, 2)
+
+    # Trigger Background Task jika masuk kategori High Risk
+    if risk_label == "High Risk" and background_tasks is not None:
+        background_tasks.add_task(
+            send_resend_alert, 
+            customer.customer_id, 
+            customer.customer_name, 
+            churn_probability_pct, 
+            explanation
+        )
 
     return {
-        "churn_probability": round(churn_proba * 100, 2),
+        "customer_id": customer.customer_id,
+        "churn_probability": churn_probability_pct,
         "churn_prediction": "Churn" if churn_pred == 1 else "No Churn",
         "risk_segment": risk_label,
         "ai_explanation": explanation
@@ -138,14 +168,14 @@ def health():
     return {"status": "ok"}
 
 @app.post("/predict")
-def predict(customer: CustomerData):
-    return predict_single(customer)
+def predict(customer: CustomerData, background_tasks: BackgroundTasks):
+    return predict_single(customer, background_tasks)
 
 @app.post("/predict/batch")
-def predict_batch(request: BatchRequest):
+def predict_batch(request: BatchRequest, background_tasks: BackgroundTasks):
     results = []
     for i, customer in enumerate(request.customers):
-        result = predict_single(customer)
+        result = predict_single(customer, background_tasks)
         result["customer_index"] = i
         results.append(result)
 
@@ -181,6 +211,6 @@ def monitoring_status():
     return {
         "total_predictions_buffered": len(recent_predictions_buffer),
         "buffer_capacity": 500,
-        "model": "XGBoost",
+        "model": "XGBoost (F1: 0.6296, AUC: 0.8405)",
         "status": "active"
     }
